@@ -1,0 +1,23 @@
+version: "1"
+rules:
+  - base: stable
+    upstream: northportio:stable
+    mergeMethod: merge
+    assignees:
+      - northportio
+    reviewers:
+      - northportio
+  - base: experimental
+    upstream: northportio:experimental
+    mergeMethod: none
+    assignees:
+      - northportio
+    reviewers:
+      - northportio
+  - base: escape23
+    upstream: northportio:escape23
+    mergeMethod: merge
+    assignees:
+      - northportio
+    reviewers:
+      - northportio
