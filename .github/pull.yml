@@ -21,3 +21,10 @@ rules:
       - northportio
     reviewers:
       - northportio
+  - base: staging
+    upstream: northportio:staging
+    mergeMethod: merge
+    assignees:
+      - northportio
+    reviewers:
+      - northportio
