@@ -1,10 +1,10 @@
 from cereal import car
-from openpilot.common.conversions import Conversions as CV
 from opendbc.can.can_define import CANDefine
 from opendbc.can.parser import CANParser
-from openpilot.selfdrive.car.interfaces import CarStateBase
+from openpilot.common.conversions import Conversions as CV
 from openpilot.selfdrive.car.ford.fordcan import CanBus
-from openpilot.selfdrive.car.ford.values import CANFD_CAR, CarControllerParams, DBC, BUTTON_STATES
+from openpilot.selfdrive.car.ford.values import DBC, CarControllerParams, FordFlags, BUTTON_STATES
+from openpilot.selfdrive.car.interfaces import CarStateBase
 
 GearShifter = car.CarState.GearShifter
 TransmissionType = car.CarParams.TransmissionType
@@ -14,10 +14,15 @@ class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
     can_define = CANDefine(DBC[CP.carFingerprint]["pt"])
+
     if CP.transmissionType == TransmissionType.automatic:
       self.shifter_values = can_define.dv["Gear_Shift_by_Wire_FD1"]["TrnRng_D_RqGsm"]
 
     self.vehicle_sensors_valid = False
+    self.steering_angle_offset_deg = 0
+
+    self.prev_distance_button = 0
+    self.distance_button = 0
 
     self.lkas_enabled = None
     self.prev_lkas_enabled = None
@@ -32,9 +37,16 @@ class CarState(CarStateBase):
     self.prev_lkas_enabled = self.lkas_enabled
     self.buttonStatesPrev = self.buttonStates.copy()
 
-    # Occasionally on startup, the ABS module recalibrates the steering pinion offset, so we need to block engagement
-    # The vehicle usually recovers out of this state within a minute of normal driving
-    self.vehicle_sensors_valid = cp.vl["SteeringPinion_Data"]["StePinCompAnEst_D_Qf"] == 3
+    if self.CP.flags & FordFlags.ALT_STEER_ANGLE:
+      self.vehicle_sensors_valid = (
+        int((cp.vl["ParkAid_Data"]["ExtSteeringAngleReq2"] + 1000) * 10) not in (32766, 32767)
+        and cp.vl["ParkAid_Data"]["EPASExtAngleStatReq"] == 0
+        and cp.vl["ParkAid_Data"]["ApaSys_D_Stat"] in (0, 1)
+      )
+    else:
+      # Occasionally on startup, the ABS module recalibrates the steering pinion offset, so we need to block engagement
+      # The vehicle usually recovers out of this state within a minute of normal driving
+      self.vehicle_sensors_valid = cp.vl["SteeringPinion_Data"]["StePinCompAnEst_D_Qf"] == 3
 
     # car speed
     ret.vEgoRaw = cp.vl["BrakeSysFeatures"]["Veh_V_ActlBrk"] * CV.KPH_TO_MS
@@ -52,26 +64,34 @@ class CarState(CarStateBase):
     ret.parkingBrake = cp.vl["DesiredTorqBrk"]["PrkBrkStatus"] in (1, 2)
 
     # steering wheel
-    ret.steeringAngleDeg = cp.vl["SteeringPinion_Data"]["StePinComp_An_Est"]
+    if self.CP.flags & FordFlags.ALT_STEER_ANGLE:
+      steering_angle_init = cp.vl["SteeringPinion_Data_Alt"]["StePinRelInit_An_Sns"]
+      if self.vehicle_sensors_valid:
+        steering_angle_est = cp.vl["ParkAid_Data"]["ExtSteeringAngleReq2"]
+        self.steering_angle_offset_deg = steering_angle_est - steering_angle_init
+      ret.steeringAngleDeg = steering_angle_init + self.steering_angle_offset_deg
+    else:
+      ret.steeringAngleDeg = cp.vl["SteeringPinion_Data"]["StePinComp_An_Est"]
     ret.steeringTorque = cp.vl["EPAS_INFO"]["SteeringColumnTorque"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > CarControllerParams.STEER_DRIVER_ALLOWANCE, 5)
     ret.steerFaultTemporary = cp.vl["EPAS_INFO"]["EPAS_Failure"] == 1
     ret.steerFaultPermanent = cp.vl["EPAS_INFO"]["EPAS_Failure"] in (2, 3)
     ret.espDisabled = cp.vl["Cluster_Info1_FD1"]["DrvSlipCtlMde_D_Rq"] != 0  # 0 is default mode
 
-    if self.CP.carFingerprint in CANFD_CAR:
+    if self.CP.flags & FordFlags.CANFD:
       # this signal is always 0 on non-CAN FD cars
       ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"] not in (1, 2, 3)
 
     # cruise state
-    ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * CV.MPH_TO_MS
+    is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else False
+    ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
     ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
     ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
     ret.cruiseState.nonAdaptive = cp.vl["Cluster_Info1_FD1"]["AccEnbl_B_RqDrv"] == 0
     ret.cruiseState.standstill = cp.vl["EngBrakeData"]["AccStopMde_D_Rq"] == 3
     ret.accFaulted = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (1, 2)
 
-    if self.CP.carFingerprint in CANFD_CAR:
+    if self.CP.flags & FordFlags.CANFD:
       ret.cruiseState.speedLimit = self.update_traffic_signals(cp_cam)
 
     if not self.CP.openpilotLongitudinalControl:
@@ -97,6 +117,8 @@ class CarState(CarStateBase):
     ret.rightBlinker = ret.rightBlinkerOn = cp.vl["Steering_Data_FD1"]["TurnLghtSwtch_D_Stat"] == 2
     # TODO: block this going to the camera otherwise it will enable stock TJA
     ret.genericToggle = bool(cp.vl["Steering_Data_FD1"]["TjaButtnOnOffPress"])
+    self.prev_distance_button = self.distance_button
+    self.distance_button = cp.vl["Steering_Data_FD1"]["AccButtnGapTogglePress"]
 
     # lock info
     ret.doorOpen = any([cp.vl["BodyInfo_3_FD1"]["DrStatDrv_B_Actl"], cp.vl["BodyInfo_3_FD1"]["DrStatPsngr_B_Actl"],
@@ -105,7 +127,7 @@ class CarState(CarStateBase):
 
     # blindspot sensors
     if self.CP.enableBsm:
-      cp_bsm = cp_cam if self.CP.carFingerprint in CANFD_CAR else cp
+      cp_bsm = cp_cam if self.CP.flags & FordFlags.CANFD else cp
       ret.leftBlindspot = cp_bsm.vl["Side_Detect_L_Stat"]["SodDetctLeft_D_Stat"] != 0
       ret.rightBlindspot = cp_bsm.vl["Side_Detect_R_Stat"]["SodDetctRight_D_Stat"] != 0
 
@@ -128,7 +150,7 @@ class CarState(CarStateBase):
 
   def update_traffic_signals(self, cp_cam):
     # TODO: Check if CAN platforms have the same signals
-    if self.CP.carFingerprint in CANFD_CAR:
+    if self.CP.flags & FordFlags.CANFD:
       self.v_limit = cp_cam.vl["Traffic_RecognitnData"]["TsrVLim1MsgTxt_D_Rq"]
       v_limit_unit = cp_cam.vl["Traffic_RecognitnData"]["TsrVlUnitMsgTxt_D_Rq"]
 
@@ -148,16 +170,28 @@ class CarState(CarStateBase):
       ("BrakeSnData_4", 50),
       ("EngBrakeData", 10),
       ("Cluster_Info1_FD1", 10),
-      ("SteeringPinion_Data", 100),
       ("EPAS_INFO", 50),
       ("Steering_Data_FD1", 10),
       ("BodyInfo_3_FD1", 2),
       ("RCMStatusMessage2_FD1", 10),
     ]
 
-    if CP.carFingerprint in CANFD_CAR:
+    if CP.flags & FordFlags.ALT_STEER_ANGLE:
+      messages += [
+        ("SteeringPinion_Data_Alt", 100),
+        ("ParkAid_Data", 50),
+      ]
+    else:
+      messages += [
+        ("SteeringPinion_Data", 100),
+      ]
+    if CP.flags & FordFlags.CANFD:
       messages += [
         ("Lane_Assist_Data3_FD1", 33),
+      ]
+    else:
+      messages += [
+        ("INSTRUMENT_PANEL", 1),
       ]
 
     if CP.transmissionType == TransmissionType.automatic:
@@ -170,7 +204,7 @@ class CarState(CarStateBase):
         ("BCM_Lamp_Stat_FD1", 1),
       ]
 
-    if CP.enableBsm and CP.carFingerprint not in CANFD_CAR:
+    if CP.enableBsm and not (CP.flags & FordFlags.CANFD):
       messages += [
         ("Side_Detect_L_Stat", 5),
         ("Side_Detect_R_Stat", 5),
@@ -188,12 +222,12 @@ class CarState(CarStateBase):
       ("IPMA_Data", 1),
     ]
 
-    if CP.carFingerprint in CANFD_CAR:
+    if CP.flags & FordFlags.CANFD:
       messages += [
         ("Traffic_RecognitnData", 1),
       ]
 
-    if CP.enableBsm and CP.carFingerprint in CANFD_CAR:
+    if CP.enableBsm and CP.flags & FordFlags.CANFD:
       messages += [
         ("Side_Detect_L_Stat", 5),
         ("Side_Detect_R_Stat", 5),
