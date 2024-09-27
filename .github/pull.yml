@@ -28,3 +28,17 @@ rules:
       - northportio
     reviewers:
       - northportio
+  - base: staging-DONOTUSE
+    upstream: northportio:staging-DONOTUSE
+    mergeMethod: merge
+    assignees:
+      - northportio
+    reviewers:
+      - northportio
+  - base: staging-rainny
+    upstream: northportio:staging-rainny
+    mergeMethod: merge
+    assignees:
+      - northportio
+    reviewers:
+      - northportio
